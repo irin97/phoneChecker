@@ -1,0 +1,43 @@
+{
+  "name": "phone-region-checker",
+  "version": "1.0.0",
+  "description": "Определение региона по номеру телефона",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-packager . PhoneRegionChecker --platform=win32 --arch=x64 --out=dist --overwrite"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.6.4",
+    "electron-packager": "^17.1.2"
+  },
+  "dependencies": {
+    "xlsx-populate": "^1.21.0"
+  },
+  "build": {
+    "appId": "com.yourcompany.phoneregionchecker",
+    "productName": "PhoneRegionChecker",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "files": [
+      "main.js",
+      "node_modules/**/*"
+    ]
+  }
+}
