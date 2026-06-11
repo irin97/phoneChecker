@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
 const XlsxPopulate = require('xlsx-populate');
 
 let mainWindow;
@@ -10,7 +10,13 @@ function sendLog(message) {
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('log-message', message);
     }
-    console.log(message); // Также выводим в консоль для отладки
+}
+
+// Функция отправки прогресса в окно
+function sendProgressUpdate(message) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('progress-message', message);
+    }
 }
 
 // Функция проверки, открыт ли файл
@@ -30,16 +36,49 @@ function isFileLocked(filePath) {
 
 // ========== FUNCTIONS ==========
 
-async function getData(phone) {
+function flashIcon() {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.flashFrame(true);
+}
+
+async function checkConnection() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000)
+
     try {
-        const response = await fetch(`http://num.voxlink.ru/get/?num=${phone}&field=region`);
-        if (!response.ok) {
-            throw new Error('Failed to get region');
-        }
-        return await response.text();
+        const response = await fetch('http://num.voxlink.ru/get/?num=79133350909&field=region', {
+            signal: controller.signal
+        })
+        clearTimeout(timer)
+        return response.ok
     } catch (err) {
-        return err.message;
+        clearTimeout(timer)
+        return false
     }
+}
+
+async function getData(phone) {
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const response = await fetch(`http://num.voxlink.ru/get/?num=${phone}&field=region`);
+            if (!response.ok) {
+                throw new Error(`Failed to get region: ${response.status} ${response.statusText}`);
+            }
+            return await response.text();
+        } catch (err) {
+            if (attempt === maxAttempts) {
+                return err.message;
+            }
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+    }
+}
+
+function getTime(timeInSec) {
+    const min = Math.trunc(timeInSec / 60);
+    const ces = Math.round(timeInSec % 60);
+    return `${min} минут ${ces} секунд`
 }
 
 async function timeoutFetch(phones) {
@@ -51,30 +90,35 @@ async function timeoutFetch(phones) {
         groupedArr.push(temp);
     }
 
-    const totalBatches = groupedArr.length;
-    sendLog(`📦 Всего пачек для обработки: ${totalBatches}`);
-
     async function fetchGroup(i) {
         return await Promise.all(groupedArr[i].map(el => getData(el)));
     }
 
+    const totalBatches = groupedArr.length;
+    const totalTimeSec = totalBatches;
+    let progressPercent = 0;
+    let timeLeft = totalTimeSec;
+
     const allResults = [];
+
     for (let i = 0; i < totalBatches; i++) {
-        sendLog(`🔄 Обработка пачки ${i + 1}/${totalBatches}...`);
         const res = await fetchGroup(i);
         allResults.push(...res);
 
-        if ((i + 1) % 10 === 0 || i === totalBatches - 1) {
-            const percent = Math.round((i + 1) / totalBatches * 100);
-            sendLog(`📈 Прогресс: ${i + 1}/${totalBatches} пачек (${percent}%)`);
-        }
+        progressPercent = Math.round((i + 1) / totalBatches * 100);
+        timeLeft = timeLeft - 1;
+        const formattedTime = getTime(timeLeft);
+
+        const progressText = `⏳ Прогресс выполнения: ${progressPercent}%, осталось времени: ${formattedTime}`;
+
+        sendProgressUpdate(progressText);
 
         if (i < totalBatches - 1) {
             await new Promise(resolve => setTimeout(resolve, 1000));
         }
     }
 
-    sendLog(`✅ Все ${totalBatches} пачек обработано!`);
+    sendLog(`✅ Все номера обработаны!`);
     return allResults;
 }
 
@@ -147,17 +191,14 @@ async function readPhonesFromExcel(filePath) {
 async function processExcelFile(filePath) {
     // Проверяем, не открыт ли файл
     if (isFileLocked(filePath)) {
-        sendLog('❌ ОШИБКА: Файл открыт в Excel!');
-        sendLog('📌 Пожалуйста, закройте Excel-файл и попробуйте снова.');
-        return;
+        throw new Error('ОШИБКА: Файл открыт в Excel! Пожалуйста, закройте Excel-файл и попробуйте снова.');
     }
 
     sendLog('📖 Читаем номера из Excel...');
     const phones = await readPhonesFromExcel(filePath);
 
     if (phones.length === 0) {
-        sendLog('❌ Номера телефонов не найдены!');
-        return;
+        throw new Error('❌ Номера телефонов не найдены!');
     }
 
     sendLog(`📊 Найдено номеров: ${phones.length}`);
@@ -172,23 +213,24 @@ async function processExcelFile(filePath) {
 
     // Ещё раз проверяем перед сохранением
     if (isFileLocked(filePath)) {
-        sendLog('❌ ОШИБКА: Файл был открыт во время обработки!');
-        sendLog('📌 Пожалуйста, закройте Excel-файл и запустите снова.');
-        return;
+        throw new Error('Файл был открыт во время обработки! Пожалуйста, закройте Excel-файл и запустите снова.');
     }
 
     await addColumnToExcel(filePath, regions, 'Регион');
 
-    sendLog('✅ ГОТОВО! Файл успешно обновлён.');
-    sendLog(`📁 Расположение файла: ${filePath}`);
+    sendLog('✅ Готово! Файл успешно обновлён.');
+    const safePath = JSON.stringify(filePath).replace(/"/g, '&quot;');
+    sendLog(`📁 Расположение файла: <span class="file-link" data-path="${safePath}">${filePath}</span>`);
+    // sendLog(`📁 Расположение файла: ${filePath}`);
 }
 
 // ========== WINDOW ==========
 
 function createWindow() {
+    Menu.setApplicationMenu(null);
     mainWindow = new BrowserWindow({
         width: 700,
-        height: 600,
+        height: 850,
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false
@@ -207,7 +249,7 @@ function createWindow() {
             display: flex;
             justify-content: center;
             align-items: center;
-            min-height: 100vh;
+            height: 100vh;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         }
         .container {
@@ -215,7 +257,7 @@ function createWindow() {
             padding: 30px;
             border-radius: 15px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            width: 600px;
+            width: 610px;
             text-align: center;
         }
         h1 {
@@ -263,7 +305,7 @@ function createWindow() {
             border-radius: 8px;
             font-family: 'Consolas', 'Monaco', monospace;
             font-size: 12px;
-            height: 350px;
+            height: 500px;
             overflow-y: auto;
         }
         .log-entry {
@@ -276,6 +318,15 @@ function createWindow() {
             color: #858585;
             margin-right: 8px;
         }
+        .file-link {
+            color: #58a6ff;
+            text-decoration: underline;
+            cursor: pointer;
+             word-break: break-all;
+        }
+        .file-link:hover {
+            color: #79c0ff;
+        }
     </style>
 </head>
 <body>
@@ -283,7 +334,7 @@ function createWindow() {
         <h1>📞 Phone Region Checker</h1>
         <p>Выберите Excel файл с номерами телефонов в колонке A</p>
         <div class="warning">
-            ⚠️ ВАЖНО: Закройте Excel-файл перед обработкой!
+            ⚠️ ВАЖНО: Закройте Excel-файл перед обработкой и выключите VPN!
         </div>
         <button id="selectBtn">📁 Выбрать Excel файл</button>
         <div class="log" id="log"></div>
@@ -293,30 +344,56 @@ function createWindow() {
         const { ipcRenderer } = require('electron');
         const logDiv = document.getElementById('log');
         
-        function addLog(message) {
+        function addLog(message, isProgress = false) {
+            let progressEntry = document.getElementById('live-progress-row');
+
+            if (isProgress && progressEntry) {
+                const time = new Date().toLocaleTimeString();
+                progressEntry.innerHTML = '<span class="log-time">[' + time + ']</span>' + message;
+                return
+            }
+
             const entry = document.createElement('div');
             entry.className = 'log-entry';
+
+            if (isProgress) {
+               entry.id = 'live-progress-row';
+            }
+
             const time = new Date().toLocaleTimeString();
             entry.innerHTML = '<span class="log-time">[' + time + ']</span>' + message;
             logDiv.appendChild(entry);
-            // Скролл НЕ двигается
+            logDiv.scrollTop = logDiv.scrollHeight;
         }
         
         ipcRenderer.on('log-message', (event, message) => {
             addLog(message);
         });
+
+        ipcRenderer.on('progress-message', (event, message) => {
+            addLog(message, true); 
+        });
         
         document.getElementById('selectBtn').onclick = async () => {
-            addLog('Выбор файла...');
+            logDiv.innerHTML = '';
+
             const result = await ipcRenderer.invoke('select-file');
-            if (result.success) {
-                addLog('✅ ' + result.message);
-            } else {
+
+            if (result && !result.success) {
                 addLog('❌ ' + result.message);
             }
         };
-        
-        addLog('✅ Готов к работе. Нажмите кнопку для выбора Excel файла.');
+
+        logDiv.addEventListener('click', (e)=> {
+            if (e.target.classList.contains('file-link')) {
+            try {
+                const filePath = JSON.parse(e.target.getAttribute('data-path'));
+                ipcRenderer.send('open-folder-with-file', filePath);
+            }  catch (err) {
+                addLog('❌ Ошибка при открытии папки: ' + err.message);
+                }
+            }
+        })
     </script>
 </body>
 </html>`;
@@ -325,6 +402,8 @@ function createWindow() {
 }
 
 async function handleFileSelect() {
+    sendLog('🔍 Проверяем файл и доступность сервера')
+
     if (isProcessing) {
         sendLog('⏳ Обработка уже выполняется, пожалуйста, подождите...');
         return { success: false, message: 'Обработка уже выполняется. Пожалуйста, подождите.' };
@@ -337,8 +416,18 @@ async function handleFileSelect() {
 
     if (!result.canceled && result.filePaths.length > 0) {
         const filePath = result.filePaths[0];
-        sendLog(`📁 Выбран файл: ${filePath}`);
 
+        const isApiAvailable = await checkConnection();
+
+        if (!isApiAvailable) {
+            flashIcon();
+            return {
+                success: false,
+                message: 'Нет связи с сервером! Возможно у вас включен VPN. ОТКЛЮЧИТЕ ВПН и попробуйте снова.'
+            }
+        }
+
+        sendLog(`📁 Выбран файл: ${filePath}`);
         isProcessing = true;
 
         mainWindow.webContents.executeJavaScript(`
@@ -348,9 +437,11 @@ async function handleFileSelect() {
 
         try {
             await processExcelFile(filePath);
-            return { success: true, message: 'Готово! Файл обновлён.' };
+            flashIcon();
+            return { success: true };
         } catch (error) {
-            sendLog(`❌ Ошибка: ${error.message}`);
+            sendLog(`${error.message}`);
+            flashIcon()
             return { success: false, message: error.message };
         } finally {
             isProcessing = false;
@@ -368,6 +459,12 @@ async function handleFileSelect() {
 app.whenReady().then(() => {
     createWindow();
     ipcMain.handle('select-file', handleFileSelect);
+
+    ipcMain.on('open-folder-with-file', (event, filePath) => {
+        if (filePath) {
+            shell.showItemInFolder(filePath);
+        }
+    });
 });
 
 app.on('window-all-closed', () => {
